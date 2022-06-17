@@ -1,0 +1,302 @@
+import json
+import os
+import boto3
+from datetime import datetime, timezone
+import requests
+
+# Function to send slack message to webhook
+def send_slack_message(message_string):
+    webhook_url = os.environ['webhook_url']
+    
+    print("######## \n\n\n sending response over slack \n\n\n ########")
+    try:
+        response = requests.post(webhook_url, data=message_string,
+                                 headers={'Content-Type': 'application/json'}
+                                 )    
+    except:
+        print("ERROR: Could not send slack message")
+  
+# Function to check for tag persistent=true for each running EC2 instance
+def isInstPersistent(tags):
+    status_flag = 'false'
+    
+    if(len(tags) == 0):
+        status_flag = 'false'
+    else:
+        for tag in tags:
+            print(tag)
+            if 'persistent' in tag.values():
+                print("Found persistent tag")
+            if (tag['Key'] == 'persistent' and tag['Value'] == 'true'):
+                print("Found persistent=true pair")
+                status_flag = 'true'
+                break
+            else:
+                print("No tag as persistent=true")  
+
+    print("returning status = %s" % status_flag)            
+    return status_flag
+
+# Function to check for tag persistent=true for each running EC2 instance
+def getInstName(tags):
+    name = ''
+    
+    if(len(tags) == 0):
+        name = '-'
+    else:
+        for tag in tags:
+            print(tag)
+            if (tag['Key'] == 'Name'):
+                print("Found Name tag")
+                name = tag['Value']
+                if (not name):
+                    name = '-'
+                break
+            else:
+                print("No Name tag")  
+                name = '-'
+
+    print("returning name = %s" % name)            
+    return name
+
+
+# Main Lambda function that scans all running EC2 instances in current region
+# and reports instances that are in running state for longer than 24-hours
+def lambda_handler(event, context):
+
+    aws_region = boto3.client('ec2')
+    region_response = ["ap-south-1"]
+
+    for i in range(len(region_response)):
+        region_name = region_response[i]
+        print(region_name)
+        ec2_resource = boto3.resource('ec2', region_name=region_name)
+
+        for inst in ec2_resource.instances.all():
+            print(inst.__dict__)
+            break # just see all options for inst
+
+        # List containing instances to be checked
+        instances_to_be_checked = []
+    
+        for inst in ec2_resource.instances.all():
+            #if(inst.state['Name'] == 'running' and inst.instance_lifecycle == 'spot'):
+            if(inst.state['Name'] == 'running'):
+                # Dict for creating entries in instances_to_be_checked[]
+                entry = {}
+            
+                print("Found that inst is running")
+                # print(inst.tags)
+            
+                # Check if inst in tagged as 'persistent = true'
+                if(inst.tags):
+                    status = isInstPersistent(inst.tags)
+                    name = getInstName(inst.tags)
+                    
+                else:
+                    status = 'false'
+                    name = '-'
+                    
+                
+                if(status == 'true'):
+                    print("#### Found persistent=true for instance %s" % inst.id)
+                else:
+                    print("#### No persistent=true for instance %s" % inst.id)
+                    entry['InstanceId'] = inst.id
+                    entry['StartTime'] = inst.launch_time
+                    entry['InstanceName'] = name
+                    entry['InstanceType'] = inst.instance_type
+
+                
+                    print(entry)
+                    instances_to_be_checked.append(entry)
+                    # print(instances_to_be_checked)                
+   
+        print("Total %d instances will be checked" % len(instances_to_be_checked))    
+        print("Instances to be checked are: %s " % instances_to_be_checked)
+
+        if(len(instances_to_be_checked) > 0):  
+          instances_to_be_reported = []
+          aware_local_now = datetime.now(timezone.utc).astimezone()
+    
+          for inst in instances_to_be_checked:
+              entry = {}
+              # print(inst)
+          
+              instRunningTime = aware_local_now - inst['StartTime']
+              instRunningTimeInSec = instRunningTime.total_seconds()
+
+              # Check if instance is running for more than 24 hours
+              if(instRunningTimeInSec > 300):
+                  entry['InstanceId'] = inst['InstanceId']
+                  entry['InstanceType'] = inst['InstanceType']
+                  startTime = inst['StartTime']
+                  entry['StartTime'] = inst['StartTime'].strftime("%d-%b-%Y (%H:%M:%S.%f)")
+
+                  entry['Uptime'] = str(instRunningTime)
+                  entry['InstanceName'] = inst['InstanceName']
+                  
+
+                  print("%s ::" % inst['InstanceId'] + " running for more than 12 hours")
+                  print("%s ::" % inst['InstanceType'] + " running for more than 12 hours")
+                  instances_to_be_reported.append(entry)
+    
+          print("######")
+          print("Total %d instances will be reported" % len(instances_to_be_reported))
+          print("Instances running for more than 12-hours are:")
+          print(instances_to_be_reported)
+    
+          # Report to slack webhook
+          # Read Slack webhook url from env variable
+          webhook_url = os.environ['webhook_url']
+
+          for inst in instances_to_be_reported:
+            instance_id = inst['InstanceId']
+            start_time = inst['StartTime']
+            uptime = inst['Uptime']
+            name = inst['InstanceName']
+            instance_type = inst['InstanceType']
+
+            username = "Lambda (" + region_name + ")"
+        
+            slack_data = {
+	        "text": "EC2 Alert",
+	        "username": username,
+            "icon_url":"https://tevi.co/resources/logo_large.png",
+  	        "blocks": [{
+	  	   	    "type": "section",
+			    "text": {
+				    "type": "mrkdwn",
+				    "text": "*EC2 instance found to be running for more than 12-hours:*\n"
+			    },
+			    "fields": [{
+					    "type": "mrkdwn",
+					    "text": "*InstanceId:*\n"
+				    },
+                    {
+					    "type": "mrkdwn",
+					    "text": "*InstanceType:*\n"
+				    },
+				    {
+					    "type": "mrkdwn",
+					    "text": "*Name:*\n"
+				    },
+				    {
+					    "type": "plain_text",
+					    "text": instance_id
+				    },
+				    {
+					    "type": "plain_text",
+					    "text": name
+				    },
+				    {
+					    "type": "mrkdwn",
+					    "text": "*Start Time:*\n"
+				    },
+				    {
+					    "type": "mrkdwn",
+					    "text": "*Uptime:*\n"
+				    },
+				    {
+					    "type": "plain_text",
+					    "text": start_time
+				    },
+				    {
+					    "type": "plain_text",
+					    "text": uptime
+				    }
+			    ]
+		      },
+		      {
+		  	      "type": "divider"
+	  	      }
+	        ]
+            }
+    
+            # new_slack_data is dict. Need to convert it to string for sending it over slack
+            # print(slack_data)
+            # print(json.dumps(slack_data))
+            final_slack_msg_str = json.dumps(slack_data)
+    
+            # slack_data = {"username": "EC2-Inventory-Notification", 
+            #               "icon_emoji": ":bell:",
+            #               'attachments': [{'color': '#ff0000', 
+            #                                'text': final_slack_msg_str}
+            #                              ]}
+                                 
+            send_slack_message(final_slack_msg_str)
+            # send_slack_message(json.dumps(slack_data))
+          
+        else: 
+            print("No instances for selected category are found!!!")
+
+******************OUTPUT*******************************************************
+A function update is still in progress so the invocation went to the previously deployed code and configuration.
+
+Test Event Name
+test
+
+Response
+null
+
+Function Logs
+START RequestId: 2f028261-e429-48a0-ba42-d354b12d3738 Version: $LATEST
+ap-south-1
+{'meta': ResourceMeta('ec2', identifiers=['id']), '_id': 'i-0bf86f9899fcd5ba1'}
+Found that inst is running
+{'Key': 'Name', 'Value': 'Deepak-Docker-Practice'}
+No tag as persistent=true
+returning status = false
+{'Key': 'Name', 'Value': 'Deepak-Docker-Practice'}
+Found Name tag
+returning name = Deepak-Docker-Practice
+#### No persistent=true for instance i-0bf86f9899fcd5ba1
+{'InstanceId': 'i-0bf86f9899fcd5ba1', 'StartTime': datetime.datetime(2022, 6, 7, 9, 47, 15, tzinfo=tzlocal()), 'InstanceName': 'Deepak-Docker-Practice', 'InstanceType': 't2.micro'}
+Found that inst is running
+{'Key': 'Name', 'Value': 'Sandeep_Maurya_Window'}
+No tag as persistent=true
+returning status = false
+{'Key': 'Name', 'Value': 'Sandeep_Maurya_Window'}
+Found Name tag
+returning name = Sandeep_Maurya_Window
+#### No persistent=true for instance i-0fd770011ada63495
+{'InstanceId': 'i-0fd770011ada63495', 'StartTime': datetime.datetime(2022, 6, 16, 5, 57, 41, tzinfo=tzlocal()), 'InstanceName': 'Sandeep_Maurya_Window', 'InstanceType': 't2.micro'}
+Found that inst is running
+{'Key': 'Environment', 'Value': 'Production'}
+No tag as persistent=true
+{'Key': 'Name', 'Value': 'sandeep-inspector'}
+No tag as persistent=true
+returning status = false
+{'Key': 'Environment', 'Value': 'Production'}
+No Name tag
+{'Key': 'Name', 'Value': 'sandeep-inspector'}
+Found Name tag
+returning name = sandeep-inspector
+#### No persistent=true for instance i-0df7a59cc1a1c997d
+{'InstanceId': 'i-0df7a59cc1a1c997d', 'StartTime': datetime.datetime(2022, 6, 9, 10, 59, 42, tzinfo=tzlocal()), 'InstanceName': 'sandeep-inspector', 'InstanceType': 't2.micro'}
+Total 3 instances will be checked
+Instances to be checked are: [{'InstanceId': 'i-0bf86f9899fcd5ba1', 'StartTime': datetime.datetime(2022, 6, 7, 9, 47, 15, tzinfo=tzlocal()), 'InstanceName': 'Deepak-Docker-Practice', 'InstanceType': 't2.micro'}, {'InstanceId': 'i-0fd770011ada63495', 'StartTime': datetime.datetime(2022, 6, 16, 5, 57, 41, tzinfo=tzlocal()), 'InstanceName': 'Sandeep_Maurya_Window', 'InstanceType': 't2.micro'}, {'InstanceId': 'i-0df7a59cc1a1c997d', 'StartTime': datetime.datetime(2022, 6, 9, 10, 59, 42, tzinfo=tzlocal()), 'InstanceName': 'sandeep-inspector', 'InstanceType': 't2.micro'}] 
+i-0bf86f9899fcd5ba1 :: running for more than 12 hours
+t2.micro :: running for more than 12 hours
+i-0fd770011ada63495 :: running for more than 12 hours
+t2.micro :: running for more than 12 hours
+i-0df7a59cc1a1c997d :: running for more than 12 hours
+t2.micro :: running for more than 12 hours
+######
+Total 3 instances will be reported
+Instances running for more than 12-hours are:
+[{'InstanceId': 'i-0bf86f9899fcd5ba1', 'InstanceType': 't2.micro', 'StartTime': '07-Jun-2022 (09:47:15.000000)', 'Uptime': '10 days, 1:32:38.378992', 'InstanceName': 'Deepak-Docker-Practice'}, {'InstanceId': 'i-0fd770011ada63495', 'InstanceType': 't2.micro', 'StartTime': '16-Jun-2022 (05:57:41.000000)', 'Uptime': '1 day, 5:22:12.378992', 'InstanceName': 'Sandeep_Maurya_Window'}, {'InstanceId': 'i-0df7a59cc1a1c997d', 'InstanceType': 't2.micro', 'StartTime': '09-Jun-2022 (10:59:42.000000)', 'Uptime': '8 days, 0:20:11.378992', 'InstanceName': 'sandeep-inspector'}]
+######## 
+sending response over slack 
+########
+######## 
+sending response over slack 
+########
+######## 
+sending response over slack 
+########
+END RequestId: 2f028261-e429-48a0-ba42-d354b12d3738
+REPORT RequestId: 2f028261-e429-48a0-ba42-d354b12d3738	Duration: 6098.76 ms	Billed Duration: 6099 ms	Memory Size: 128 MB	Max Memory Used: 83 MB	Init Duration: 427.40 ms
+
+Request ID
+2f028261-e429-48a0-ba42-d354b12d3738
